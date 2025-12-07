@@ -161,19 +161,36 @@ def extract_url_features(url):
         return feats
 
 # ===============================
-# Pattern-based detection
+# Pattern-based detection (softer)
 # ===============================
 def pattern_based_check(url):
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    host = domain.split(":")[0]  # strip port if present
+
+    # More robust IP check
+    parts = host.split(".")
+    is_ip = (
+        len(parts) == 4 and
+        all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+    )
+
+    has_at = "@" in url
+    # Only flag if there are many dashes (3 or more) in hostname
+    many_dashes = host.count("-") >= 3
+    # Only flag as suspicious if subdomain depth is high
+    suspicious_subdomain = host.count(".") >= 3
+
     patterns = {
-        "Has IP": urlparse(url).netloc.replace(".", "").isdigit(),
-        "Has @": "@" in url,
-        "Has -": "-" in urlparse(url).netloc,
-        "Suspicious Subdomain": urlparse(url).netloc.count(".") > 2,
+        "Has IP": is_ip,
+        "Has @": has_at,
+        "Many Dashes": many_dashes,
+        "Suspicious Subdomain": suspicious_subdomain,
     }
     return patterns
 
 # ===============================
-# Unified Hybrid Check
+# Unified Hybrid Check (tuned risk logic)
 # ===============================
 def hybrid_check(url, api_key=GOOGLE_API_KEY):
     url = url.strip().lower()
@@ -187,16 +204,20 @@ def hybrid_check(url, api_key=GOOGLE_API_KEY):
     try:
         X_scaled = scaler.transform(features_df)
         ml_proba = rf_model.predict_proba(X_scaled)[0][1]
-    except Exception:
+    except Exception as e:
+        print("❌ ML inference error:", e)
+        traceback.print_exc()
         ml_proba = None
 
     pattern_flags = pattern_based_check(url)
-    pattern_flag = any(pattern_flags.values())
+    num_pattern_flags = sum(pattern_flags.values())
+    pattern_flag = num_pattern_flags > 0
 
     # --- Risk assessment ---
     risk_level = "Low"
     reason_list = []
 
+    # Strong signals: blocklists / Google Safe Browsing
     if phishtank_flag:
         risk_level = "High"
         reason_list.append("Phishing (PhishTank)")
@@ -204,24 +225,44 @@ def hybrid_check(url, api_key=GOOGLE_API_KEY):
         risk_level = "High"
         reason_list.append("Phishing (Google Safe Browsing)")
 
+    # ML-based signals
     if ml_proba is not None:
-        if ml_proba > 0.75:
+        if ml_proba >= 0.85:
             risk_level = "High"
             reason_list.append(f"High ML score ({ml_proba:.2f})")
-        elif ml_proba > 0.6:
-            if pattern_flag:
+        elif ml_proba >= 0.70:
+            if num_pattern_flags >= 1:
                 risk_level = "High"
-                reason_list.append(f"ML score {ml_proba:.2f} + Suspicious Pattern")
+                reason_list.append(f"ML score {ml_proba:.2f} + pattern flags")
             else:
-                risk_level = "Medium"
+                # No strong patterns, but ML is moderately high
+                if risk_level != "High":
+                    risk_level = "Medium"
                 reason_list.append(f"Medium ML score ({ml_proba:.2f})")
+        elif ml_proba >= 0.50:
+            # Borderline zone
+            if num_pattern_flags >= 2 and risk_level == "Low":
+                risk_level = "Medium"
+                reason_list.append(
+                    f"Borderline ML score ({ml_proba:.2f}) + multiple patterns"
+                )
+            else:
+                reason_list.append(f"Low ML score ({ml_proba:.2f})")
         else:
-            reason_list.append(f"Low ML score ({ml_proba:.2f})")
+            reason_list.append(f"Very low ML score ({ml_proba:.2f})")
+    else:
+        reason_list.append("ML score unavailable")
 
-    if pattern_flag and risk_level == "Low":
-        risk_level = "Medium"
-        labels = [k for k, v in pattern_flags.items() if v]
-        reason_list.append("Suspicious Pattern: " + ", ".join(labels))
+    # Pattern-only influence when everything else is low
+    if risk_level == "Low":
+        if num_pattern_flags >= 2:
+            risk_level = "Medium"
+            labels = [k for k, v in pattern_flags.items() if v]
+            reason_list.append("Suspicious Pattern: " + ", ".join(labels))
+        elif num_pattern_flags == 1:
+            labels = [k for k, v in pattern_flags.items() if v]
+            # Only log, don't upgrade to Medium
+            reason_list.append("Mild pattern flags: " + ", ".join(labels))
 
     # --- Final status ---
     if risk_level == "High":
